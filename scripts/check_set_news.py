@@ -137,6 +137,16 @@ def download_attachments(item: dict) -> list[Path]:
     return paths
 
 def main():
+    # --- SMTP test mode (manual run) ---
+    if os.getenv("SMTP_TEST", "0") == "1":
+        send_email(
+            subject=f"SMTP TEST: SET watcher ({SYMBOL})",
+            body="If you got this email, SMTP secrets are working.",
+            attachments=[]
+        )
+        print("SMTP test email sent.")
+        return
+        
     state = load_state()
     seen = set(state.get("seen_ids", []))
 
