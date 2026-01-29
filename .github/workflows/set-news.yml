@@ -31,6 +31,7 @@ jobs:
           LANG: th
           LOOKBACK_DAYS: "14"
           MAX_NEW_ITEMS: "5"
+          SMTP_TEST: "1" # << -- Test one for test purpose (1 = test)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -46,5 +47,3 @@ jobs:
           git add state.json
           git commit -m "Update state" || echo "No changes"
           git push
-
-
