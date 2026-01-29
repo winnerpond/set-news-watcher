@@ -32,14 +32,43 @@ def fetch_news(from_date: str, to_date: str) -> list[dict]:
         "keyword": "",
         "lang": LANG,
     }
-    # Some sites require a user-agent; harmless to include
-    headers = {"User-Agent": "Mozilla/5.0 (GitHub Actions)"}
-    r = requests.get(API_URL, params=params, headers=headers, timeout=30)
+
+    session = requests.Session()
+
+    # 1) Warm up cookies by visiting the real page first
+    warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
+    session.get(
+        warm_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+        timeout=30,
+    )
+
+    # 2) Call the API with browser-like headers + referer
+    r = session.get(
+        API_URL,
+        params=params,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": warm_url,
+            "Origin": "https://www.set.or.th",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        timeout=30,
+    )
+
+    # If still blocked, show the response body in logs for debugging
+    if r.status_code == 403:
+        raise RuntimeError(f"403 Forbidden from SET API. Response text: {r.text[:300]}")
+
     r.raise_for_status()
     data = r.json()
-
-    # The response shape can vary; keep this defensive:
-    # try common keys: "news", "data", "result"
+    
     if isinstance(data, dict):
         for k in ("news", "data", "result"):
             if k in data and isinstance(data[k], list):
