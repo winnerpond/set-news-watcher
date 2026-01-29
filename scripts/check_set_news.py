@@ -198,6 +198,16 @@ def main():
     else:
         print("SMTP not configured; printing news:\n")
         print(body)
+   
+    # --- SMTP test mode (manual run) ---
+    if os.getenv("SMTP_TEST", "0") == "1":
+        send_email(
+            subject=f"SMTP TEST: SET watcher ({SYMBOL})",
+            body="If you got this email, SMTP secrets are working.",
+            attachments=[]
+        )
+        print("SMTP test email sent.")
+        return
 
 if __name__ == "__main__":
     main()
