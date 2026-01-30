@@ -16,15 +16,12 @@ LANG = os.getenv("LANG", "th")  # "th" or "en"
 
 API_URL = "https://www.set.or.th/api/set/news/search"
 
-# Filter controls
+# ✅ Filter controls (set via GitHub Actions env if you want)
 HEADLINE_FILTER = os.getenv(
     "HEADLINE_FILTER",
-    "รายงานผลการซื้อหุ้นคืนกรณีเพื่อการบริหารทางการเงิน"
+    "รายงานผลการซื้อหุ้นคืนกรณีเพื่อการบริหารทางการเงิน",
 ).strip()
 FILTER_MODE = os.getenv("FILTER_MODE", "exact").strip().lower()  # exact | contains
-
-# How much text from detail page to include in email
-DETAIL_MAX_CHARS = int(os.getenv("DETAIL_MAX_CHARS", "1200"))
 
 
 def ddmmyyyy(d: datetime) -> str:
@@ -76,7 +73,6 @@ def extract_url(item: dict) -> str:
     v = item.get("url")
     if v and str(v).strip():
         return str(v).strip()
-    # fallback build
     _id = extract_id(item)
     lang_path = "th" if LANG == "th" else "en"
     return f"https://www.set.or.th/{lang_path}/market/news-and-alert/newsdetails?id={_id}&symbol={SYMBOL}"
@@ -116,7 +112,10 @@ def _browser_headers_json(referer: str) -> dict[str, str]:
 
 
 def make_session() -> tuple[requests.Session, str]:
-    """Create a requests session and warm it up against the quote/news page to avoid 403."""
+    """
+    Create a requests session and warm it up against the quote/news page to avoid 403.
+    Returns (session, warm_url).
+    """
     session = requests.Session()
     warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
     session.get(warm_url, headers=_browser_headers_html(), timeout=30)
@@ -145,11 +144,11 @@ def fetch_news(session: requests.Session, warm_url: str, from_date: str, to_date
 
     data = r.json()
 
-    # Confirmed structure: {"totalCount": ..., "newsInfoList": [...]}
+    # ✅ Confirmed structure: {"totalCount": ..., "newsInfoList": [...]}
     if isinstance(data, dict) and isinstance(data.get("newsInfoList"), list):
         return data["newsInfoList"]
 
-    # fallback keys
+    # Fallback keys (if SET changes later)
     if isinstance(data, dict):
         for k in ("news", "data", "result"):
             v = data.get(k)
@@ -160,14 +159,13 @@ def fetch_news(session: requests.Session, warm_url: str, from_date: str, to_date
 
 
 def _clean_text(t: str) -> str:
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def fetch_news_detail_text(session: requests.Session, detail_url: str) -> Optional[str]:
     """
-    Fetch the news detail page and extract meaningful text.
-    We keep it robust by using visible text from the page, then truncating.
+    Fetch the news detail page and extract visible text.
+    We keep the full text for parsing; formatting will be trimmed later.
     """
     try:
         resp = session.get(detail_url, headers=_browser_headers_html(), timeout=30)
@@ -177,15 +175,11 @@ def fetch_news_detail_text(session: requests.Session, detail_url: str) -> Option
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Remove scripts/styles
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
-    # Try a few likely containers first (if SET changes layout, we fall back to full text)
+    # Try common containers first; fallback to whole document
     candidates = []
-
-    # common-ish containers (best-effort)
     for sel in [
         "main",
         "article",
@@ -201,15 +195,112 @@ def fetch_news_detail_text(session: requests.Session, detail_url: str) -> Option
         candidates.append(soup.get_text(" ", strip=True))
 
     text = _clean_text(max(candidates, key=len))
-
-    # Keep only a reasonable chunk
-    if len(text) > DETAIL_MAX_CHARS:
-        text = text[:DETAIL_MAX_CHARS].rstrip() + "…"
-
     return text
 
 
+def _pick(text: str, label: str) -> str:
+    """
+    Extract value after a Thai label. Stops at end-of-line-ish boundary.
+    We work on "flattened" text, so we use a conservative pattern that
+    captures until the next known label-like separator.
+    """
+    # Try direct "label : value" style first
+    pattern = rf"{re.escape(label)}\s*:\s*(.+?)\s*(?=(?:\b\w|\Z))"
+    m = re.search(pattern, text)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def parse_buyback_fields(page_text: str) -> dict[str, str]:
+    """
+    Extract the key fields you requested from the buyback report detail page text.
+    """
+    t = page_text
+
+    fields = {
+        "เรื่อง": _pick(t, "เรื่อง"),
+        "วันที่รายงานผล": _pick(t, "วันที่รายงานผล"),
+        "วิธีการซื้อหุ้นคืน": _pick(t, "วิธีการซื้อหุ้นคืน"),
+        "วันที่ครบกำหนดโครงการ": _pick(t, "วันที่ครบกำหนดโครงการ"),
+        "วันที่คณะกรรมการมีมติ": _pick(t, "วันที่คณะกรรมการมีมติ"),
+        "จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ (หุ้น)": _pick(t, "จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ (หุ้น)"),
+        "%ของจำนวนหุ้นซื้อคืนสูงสุดต่อจำนวนหุ้นที่ชำระแล้ว": _pick(t, "%ของจำนวนหุ้นซื้อคืนสูงสุดต่อจำนวนหุ้นที่ชำระแล้ว"),
+        "วันที่ซื้อหุ้นคืน": _pick(t, "วันที่ซื้อหุ้นคืน"),
+        "จำนวนหุ้นซื้อคืน(หุ้น)": _pick(t, "จำนวนหุ้นซื้อคืน(หุ้น)"),
+        "ราคาที่ซื้อต่อหุ้นหรือราคาสูงสุด(บาท/หุ้น)": _pick(t, "ราคาที่ซื้อต่อหุ้นหรือราคาสูงสุด(บาท/หุ้น)"),
+        "ราคาต่ำสุด(บาท/หุ้น)": _pick(t, "ราคาต่ำสุด(บาท/หุ้น)"),
+        "มูลค่ารวม(บาท)": _pick(t, "มูลค่ารวม(บาท)"),
+        "จำนวนรวมของหุ้นซื้อคืนในโครงการจนถึงปัจจุบัน": _pick(t, "จำนวนรวมของหุ้นซื้อคืนในโครงการจนถึงปัจจุบัน"),
+        "%ของจำนวนหุ้นซื้อคืนต่อจำนวนหุ้นที่ชำระแล้ว": _pick(t, "%ของจำนวนหุ้นซื้อหุ้นคืนต่อจำนวนหุ้นที่ชำระแล้ว"),
+        "มูลค่ารวมที่ซื้อคืน(บาท)": _pick(t, "มูลค่ารวมที่ซื้อคืน(บาท)"),
+    }
+
+    # Note: label variation fix (your text shows "%ของจำนวนหุ้นซื้อคืนต่อจำนวนหุ้นที่ชำระแล้ว")
+    if "%ของจำนวนหุ้นซื้อหุ้นคืนต่อจำนวนหุ้นที่ชำระแล้ว" in fields and not fields["%ของจำนวนหุ้นซื้อหุ้นคืนต่อจำนวนหุ้นที่ชำระแล้ว"]:
+        fields["%ของจำนวนหุ้นซื้อหุ้นคืนต่อจำนวนหุ้นที่ชำระแล้ว"] = _pick(t, "%ของจำนวนหุ้นซื้อคืนต่อจำนวนหุ้นที่ชำระแล้ว")
+
+    return {k: v for k, v in fields.items() if v}
+
+
+def format_buyback_summary(fields: dict[str, str], link: str, api_dt: str) -> str:
+    """
+    Trimmed email-ready message.
+    api_dt is the timestamp from the API list (ISO).
+    """
+    lines = []
+    lines.append("รายงานผลการซื้อหุ้นคืน (สรุป)")
+    lines.append(f"Time (SET): {api_dt or '(no timestamp)'}")
+    lines.append(f"Link: {link}")
+    lines.append("")
+
+    if "เรื่อง" in fields:
+        lines.append(f"เรื่อง: {fields['เรื่อง']}")
+    if "วันที่รายงานผล" in fields:
+        lines.append(f"วันที่รายงานผล: {fields['วันที่รายงานผล']}")
+    if "วิธีการซื้อหุ้นคืน" in fields:
+        lines.append(f"วิธีการ: {fields['วิธีการซื้อหุ้นคืน']}")
+    if "วันที่ครบกำหนดโครงการ" in fields:
+        lines.append(f"วันที่ครบกำหนดโครงการ: {fields['วันที่ครบกำหนดโครงการ']}")
+    if "วันที่คณะกรรมการมีมติ" in fields:
+        lines.append(f"วันที่คณะกรรมการมีมติ: {fields['วันที่คณะกรรมการมีมติ']}")
+
+    max_sh = fields.get("จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ (หุ้น)", "")
+    max_pct = fields.get("%ของจำนวนหุ้นซื้อคืนสูงสุดต่อจำนวนหุ้นที่ชำระแล้ว", "")
+    if max_sh or max_pct:
+        lines.append(f"หุ้นซื้อคืนสูงสุดตามโครงการ: {max_sh} หุ้น ({max_pct}%)".strip())
+
+    # Latest buyback result
+    if "วันที่ซื้อหุ้นคืน" in fields:
+        lines.append("")
+        lines.append("ผลการซื้อหุ้นคืน (ล่าสุด)")
+        lines.append(f"วันที่ซื้อหุ้นคืน: {fields['วันที่ซื้อหุ้นคืน']}")
+        if "จำนวนหุ้นซื้อคืน(หุ้น)" in fields:
+            lines.append(f"จำนวนหุ้นซื้อคืน: {fields['จำนวนหุ้นซื้อคืน(หุ้น)']} หุ้น")
+        lo = fields.get("ราคาต่ำสุด(บาท/หุ้น)", "")
+        hi = fields.get("ราคาที่ซื้อต่อหุ้นหรือราคาสูงสุด(บาท/หุ้น)", "")
+        if lo or hi:
+            lines.append(f"ช่วงราคา: {lo} - {hi} บาท/หุ้น".strip())
+        if "มูลค่ารวม(บาท)" in fields:
+            lines.append(f"มูลค่ารวม: {fields['มูลค่ารวม(บาท)']} บาท")
+
+    # Cumulative
+    cum_sh = fields.get("จำนวนรวมของหุ้นซื้อคืนในโครงการจนถึงปัจจุบัน", "")
+    cum_pct = fields.get("%ของจำนวนหุ้นซื้อหุ้นคืนต่อจำนวนหุ้นที่ชำระแล้ว", "")
+    cum_val = fields.get("มูลค่ารวมที่ซื้อคืน(บาท)", "")
+    if cum_sh or cum_val or cum_pct:
+        lines.append("")
+        lines.append("สะสมทั้งโครงการ (ถึงปัจจุบัน)")
+        if cum_sh:
+            lines.append(f"จำนวนสะสม: {cum_sh} หุ้น ({cum_pct}%)".strip())
+        if cum_val:
+            lines.append(f"มูลค่าสะสม: {cum_val} บาท")
+
+    return "\n".join(lines)
+
+
 def main() -> None:
+    # Optional test flags
     smtp_test = os.getenv("SMTP_TEST", "0") == "1"
     force_send = os.getenv("FORCE_SEND", "0") == "1"
     dry_run = os.getenv("DRY_RUN", "0") == "1"
@@ -227,7 +318,7 @@ def main() -> None:
     state = load_state()
     seen = set(state.get("seen_ids", []))
 
-    lookback_days = int(os.getenv("LOOKBACK_DAYS", "14"))
+    lookback_days = int(os.getenv("LOOKBACK_DAYS", "60"))
     max_new_items = int(os.getenv("MAX_NEW_ITEMS", "5"))
 
     today = datetime.now()
@@ -258,7 +349,7 @@ def main() -> None:
             all_new_items.append(it)
     print(f"Computed new items (after filter): {len(all_new_items)}")
 
-    # Force demo using latest matching item
+    # Force demo using the latest matching item
     if not all_new_items and force_send:
         if filtered_items:
             print("FORCE_SEND=1 enabled. Using latest matching item as demo.")
@@ -271,28 +362,30 @@ def main() -> None:
         print("No new news.")
         return
 
-    # ONE EMAIL ONLY:
+    # ✅ ONE EMAIL ONLY behavior: email up to MAX_NEW_ITEMS, but mark ALL new items as seen.
     notify_items = all_new_items[:max_new_items]
 
-    # Build email body (headline + timestamp + link + extracted detail text)
     blocks: list[str] = []
     for it in notify_items:
-        headline = extract_headline(it)
-        dt = extract_datetime(it)
+        api_dt = extract_datetime(it)
         url = extract_url(it)
 
-        detail_text = fetch_news_detail_text(session, url) or "(Could not extract detail text)"
+        page_text = fetch_news_detail_text(session, url) or ""
+        fields = parse_buyback_fields(page_text)
 
-        block = (
-            f"• {headline}\n"
-            f"  Time: {dt or '(no timestamp)'}\n"
-            f"  Link: {url}\n"
-            f"  Detail: {detail_text}\n"
-        )
-        blocks.append(block)
+        # Fallback if parsing fails
+        if fields:
+            blocks.append(format_buyback_summary(fields, link=url, api_dt=api_dt))
+        else:
+            blocks.append(
+                f"รายงานผลการซื้อหุ้นคืน (สรุป)\n"
+                f"Time (SET): {api_dt or '(no timestamp)'}\n"
+                f"Link: {url}\n\n"
+                f"(Could not parse structured fields from detail page)\n"
+            )
 
     subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s) [filtered]"
-    body = "\n\n".join(blocks)
+    body = "\n\n" + ("\n\n" + ("-" * 60) + "\n\n").join(blocks)
 
     if os.getenv("SMTP_HOST"):
         if dry_run:
@@ -307,13 +400,13 @@ def main() -> None:
         print(subject)
         print(body[:2000])
 
-    # Mark ALL new items as seen (even those not emailed due to cap)
+    # ✅ Mark ALL new items as seen (so you only get one email)
     for it in all_new_items:
         seen.add(extract_id(it))
+
     state["seen_ids"] = list(seen)
     save_state(state)
     print(f"State updated. Total seen IDs now: {len(seen)}")
-
 
 if __name__ == "__main__":
     main()
