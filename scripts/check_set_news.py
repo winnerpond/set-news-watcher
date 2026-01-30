@@ -25,7 +25,6 @@ def load_state() -> dict:
     try:
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except Exception:
-        # If state is corrupted, fail safe by resetting
         return {"seen_ids": []}
 
 
@@ -34,50 +33,31 @@ def save_state(state: dict) -> None:
 
 
 def extract_id(item: dict) -> str:
-    # Prefer stable IDs returned by SET
     for k in ("id", "newsId", "news_id"):
         v = item.get(k)
         if v is not None and str(v).strip() != "":
             return str(v)
-
-    # Fallback to URL if present
     for k in ("url", "link", "detailUrl", "detailsUrl"):
         v = item.get(k)
         if v is not None and str(v).strip() != "":
             return str(v)
-
-    # Last resort: stable JSON string
     return json.dumps(item, sort_keys=True, ensure_ascii=False)
 
 
-def extract_title(item: dict) -> str:
+def extract_headline(item: dict) -> str:
     for k in ("headline", "title", "subject"):
         v = item.get(k)
         if v is not None and str(v).strip() != "":
             return str(v).strip()
-    return "(no title)"
+    return "(no headline)"
 
 
-def extract_publish_dt(item: dict) -> str:
-    # We don't assume exact field names; log whichever exists
+def extract_datetime(item: dict) -> str:
     for k in ("datetime", "dateTime", "publishDate", "publish_date", "date"):
         v = item.get(k)
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return ""
-
-
-def build_detail_url(item: dict) -> str:
-    # If API provides a direct URL, use it
-    for k in ("url", "link", "detailUrl", "detailsUrl"):
-        v = item.get(k)
-        if v is not None and str(v).strip() != "":
-            return str(v)
-
-    # Otherwise build a SET news detail URL (commonly works)
-    _id = extract_id(item)
-    lang_path = "th" if LANG == "th" else "en"
-    return f"https://www.set.or.th/{lang_path}/market/news-and-alert/newsdetails?id={_id}&symbol={SYMBOL}"
 
 
 def _browser_headers_html() -> dict[str, str]:
@@ -105,34 +85,7 @@ def _browser_headers_json(referer: str) -> dict[str, str]:
     }
 
 
-def _find_list_of_dicts(obj):
-    """Return the first list found that looks like a list[dict]."""
-    if isinstance(obj, list):
-        if obj and all(isinstance(x, dict) for x in obj):
-            return obj
-        return None
-    if isinstance(obj, dict):
-        for v in obj.values():
-            found = _find_list_of_dicts(v)
-            if found is not None:
-                return found
-    return None
-
-def _find_list_of_dicts(obj):
-    """Return the first list found that looks like a list[dict]."""
-    if isinstance(obj, list):
-        if obj and all(isinstance(x, dict) for x in obj):
-            return obj
-        return None
-    if isinstance(obj, dict):
-        for v in obj.values():
-            found = _find_list_of_dicts(v)
-            if found is not None:
-                return found
-    return None
-
-
-def fetch_news(from_date: str, to_date: str) -> list[dict]:
+def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
     params = {
         "symbol": SYMBOL,
         "fromDate": from_date,
@@ -142,9 +95,8 @@ def fetch_news(from_date: str, to_date: str) -> list[dict]:
     }
 
     session = requests.Session()
-    warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
 
-    # warm up cookies
+    warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
     session.get(warm_url, headers=_browser_headers_html(), timeout=30)
 
     r = session.get(
@@ -160,17 +112,22 @@ def fetch_news(from_date: str, to_date: str) -> list[dict]:
 
     data = r.json()
 
-    # DEBUG: show the response shape in Actions logs (optional)
-    if os.getenv("DEBUG_JSON", "0") == "1":
-        import json
-        print("DEBUG_JSON response keys/type:", type(data))
-        print(json.dumps(data, ensure_ascii=False)[:2000])  # first 2000 chars
+    # ✅ Confirmed structure from your DEBUG: {"totalCount": ..., "newsInfoList": [...]}
+    if isinstance(data, dict) and isinstance(data.get("newsInfoList"), list):
+        return data["newsInfoList"]
 
-    found = _find_list_of_dicts(data)
-    return found or []
+    # Fallbacks (in case SET changes structure later)
+    if isinstance(data, dict):
+        for k in ("news", "data", "result"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+
+    return []
+
 
 def main() -> None:
-    # --- optional test modes ---
+    # Optional test flags
     smtp_test = os.getenv("SMTP_TEST", "0") == "1"
     force_send = os.getenv("FORCE_SEND", "0") == "1"
     dry_run = os.getenv("DRY_RUN", "0") == "1"
@@ -201,54 +158,43 @@ def main() -> None:
     items = fetch_news(ddmmyyyy(from_dt), ddmmyyyy(today))
     print(f"Fetched {len(items)} item(s) from SET API")
 
-    # Show sample IDs for debugging
-    for it in items[:3]:
-        print("Sample:", extract_id(it), "|", extract_publish_dt(it), "|", extract_title(it)[:80])
-
-    # Determine new items
-    new_items: list[dict] = []
+    # Compute ALL truly new items
+    all_new_items: list[dict] = []
     for it in items:
         _id = extract_id(it)
         if _id not in seen:
-            new_items.append(it)
+            all_new_items.append(it)
 
-    print(f"Computed new items: {len(new_items)}")
+    print(f"Computed new items: {len(all_new_items)}")
 
-    # If nothing new, optionally force-send a demo (latest 1 item)
-    if not new_items and force_send:
+    # If nothing new, optionally force a demo
+    if not all_new_items and force_send:
         print("FORCE_SEND=1 enabled. Using latest 1 item as demo.")
-        new_items = items[:1]
+        all_new_items = items[:1]
 
-    if not new_items:
+    if not all_new_items:
         print("No new news.")
         return
 
-    # Cap
-    new_items = new_items[:max_new_items]
-    print(f"Will notify {len(new_items)} item(s) (capped by MAX_NEW_ITEMS={max_new_items})")
+    # ✅ ONE EMAIL ONLY behavior:
+    # We email at most MAX_NEW_ITEMS, but we mark ALL new items as seen.
+    notify_items = all_new_items[:max_new_items]
 
-    # Build email body
+    # Build “headlines only” email body
     lines: list[str] = []
-    newly_seen_ids: list[str] = []
+    for it in notify_items:
+        headline = extract_headline(it)
+        dt = extract_datetime(it)
+        # If you want *only* headline and nothing else, remove the date line below.
+        if dt:
+            lines.append(f"- {headline} ({dt})")
+        else:
+            lines.append(f"- {headline}")
 
-    for it in new_items:
-        _id = extract_id(it)
-        title = extract_title(it)
-        pub = extract_publish_dt(it)
-        url = build_detail_url(it)
+    subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s)"
+    body = "\n".join(lines)
 
-        block = f"- {title}"
-        if pub:
-            block += f"\n  Date: {pub}"
-        block += f"\n  Link: {url}"
-
-        lines.append(block)
-        newly_seen_ids.append(_id)
-
-    subject = f"SET Alert ({SYMBOL}): {len(new_items)} item(s)"
-    body = "\n\n".join(lines)
-
-    # Send email (or dry run)
+    # Send or dry run
     if os.getenv("SMTP_HOST"):
         if dry_run:
             print("DRY_RUN=1 enabled. Would send email:")
@@ -262,13 +208,14 @@ def main() -> None:
         print(subject)
         print(body)
 
-    # Update state only if we successfully reached here (even in DRY_RUN)
-    for _id in newly_seen_ids:
-        seen.add(_id)
+    # ✅ Mark ALL new items as seen (even those not emailed due to cap)
+    for it in all_new_items:
+        seen.add(extract_id(it))
 
     state["seen_ids"] = list(seen)
     save_state(state)
     print(f"State updated. Total seen IDs now: {len(seen)}")
+
 
 if __name__ == "__main__":
     main()
