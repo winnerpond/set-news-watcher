@@ -31,10 +31,13 @@ jobs:
           LANG: th
           LOOKBACK_DAYS: "14"
           MAX_NEW_ITEMS: "5"
+          
+          HEADLINE_FILTER: "รายงานผลการซื้อหุ้นคืนกรณีเพื่อการบริหารทางการเงิน"
+          FILTER_MODE: "exact"
 
           # For testing purpose
           #SMTP_TEST: "1"
-          #FORCE_SEND: "1"
+          FORCE_SEND: "1"
           #DEBUG_JSON: "1"
 
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
