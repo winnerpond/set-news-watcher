@@ -14,10 +14,15 @@ LANG = os.getenv("LANG", "th")  # "th" or "en"
 
 API_URL = "https://www.set.or.th/api/set/news/search"
 
+# ✅ Filter controls (you can also set these in GitHub Actions env)
+HEADLINE_FILTER = os.getenv(
+    "HEADLINE_FILTER",
+    "รายงานผลการซื้อหุ้นคืนกรณีเพื่อการบริหารทางการเงิน"
+).strip()
+FILTER_MODE = os.getenv("FILTER_MODE", "exact").strip().lower()  # exact | contains
 
 def ddmmyyyy(d: datetime) -> str:
     return d.strftime("%d/%m/%Y")
-
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
@@ -27,10 +32,8 @@ def load_state() -> dict:
     except Exception:
         return {"seen_ids": []}
 
-
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def extract_id(item: dict) -> str:
     for k in ("id", "newsId", "news_id"):
@@ -43,14 +46,12 @@ def extract_id(item: dict) -> str:
             return str(v)
     return json.dumps(item, sort_keys=True, ensure_ascii=False)
 
-
 def extract_headline(item: dict) -> str:
     for k in ("headline", "title", "subject"):
         v = item.get(k)
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return "(no headline)"
-
 
 def extract_datetime(item: dict) -> str:
     for k in ("datetime", "dateTime", "publishDate", "publish_date", "date"):
@@ -59,6 +60,13 @@ def extract_datetime(item: dict) -> str:
             return str(v).strip()
     return ""
 
+def headline_matches(headline: str) -> bool:
+    if not HEADLINE_FILTER:
+        return True
+    if FILTER_MODE == "contains":
+        return HEADLINE_FILTER in headline
+    # default exact
+    return headline == HEADLINE_FILTER
 
 def _browser_headers_html() -> dict[str, str]:
     return {
@@ -69,7 +77,6 @@ def _browser_headers_html() -> dict[str, str]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-
 
 def _browser_headers_json(referer: str) -> dict[str, str]:
     return {
@@ -83,7 +90,6 @@ def _browser_headers_json(referer: str) -> dict[str, str]:
         "Origin": "https://www.set.or.th",
         "X-Requested-With": "XMLHttpRequest",
     }
-
 
 def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
     params = {
@@ -112,11 +118,11 @@ def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
 
     data = r.json()
 
-    # ✅ Confirmed structure from your DEBUG: {"totalCount": ..., "newsInfoList": [...]}
+    # ✅ Confirmed structure: {"totalCount": ..., "newsInfoList": [...]}
     if isinstance(data, dict) and isinstance(data.get("newsInfoList"), list):
         return data["newsInfoList"]
 
-    # Fallbacks (in case SET changes structure later)
+    # Fallbacks (if SET changes later)
     if isinstance(data, dict):
         for k in ("news", "data", "result"):
             v = data.get(k)
@@ -154,47 +160,59 @@ def main() -> None:
     print(f"Symbol={SYMBOL} Lang={LANG}")
     print(f"Lookback: {lookback_days} day(s)  Range: {ddmmyyyy(from_dt)} -> {ddmmyyyy(today)}")
     print(f"Seen IDs in state: {len(seen)}")
+    print(f"Headline filter mode={FILTER_MODE} filter='{HEADLINE_FILTER}'")
 
     items = fetch_news(ddmmyyyy(from_dt), ddmmyyyy(today))
     print(f"Fetched {len(items)} item(s) from SET API")
 
-    # Compute ALL truly new items
-    all_new_items: list[dict] = []
+    # ✅ Filter first
+    filtered_items: list[dict] = []
     for it in items:
+        hl = extract_headline(it)
+        if headline_matches(hl):
+            filtered_items.append(it)
+
+    print(f"Filtered items (headline match): {len(filtered_items)}")
+
+    # Compute new items only from filtered list
+    all_new_items: list[dict] = []
+    for it in filtered_items:
         _id = extract_id(it)
         if _id not in seen:
             all_new_items.append(it)
 
-    print(f"Computed new items: {len(all_new_items)}")
+    print(f"Computed new items (after filter): {len(all_new_items)}")
 
-    # If nothing new, optionally force a demo
+    # If nothing new, optionally force a demo using the latest matching item
     if not all_new_items and force_send:
-        print("FORCE_SEND=1 enabled. Using latest 1 item as demo.")
-        all_new_items = items[:1]
+        if filtered_items:
+            print("FORCE_SEND=1 enabled. Using latest matching item as demo.")
+            all_new_items = filtered_items[:1]
+        else:
+            print("FORCE_SEND=1 enabled, but no matching items exist in the lookback window.")
+            return
 
     if not all_new_items:
         print("No new news.")
         return
 
     # ✅ ONE EMAIL ONLY behavior:
-    # We email at most MAX_NEW_ITEMS, but we mark ALL new items as seen.
+    # Email at most MAX_NEW_ITEMS, but mark ALL new items as seen.
     notify_items = all_new_items[:max_new_items]
 
-    # Build “headlines only” email body
+    # Build email (headline + timestamp)
     lines: list[str] = []
     for it in notify_items:
         headline = extract_headline(it)
         dt = extract_datetime(it)
-        # If you want *only* headline and nothing else, remove the date line below.
         if dt:
             lines.append(f"- {headline} ({dt})")
         else:
             lines.append(f"- {headline}")
 
-    subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s)"
+    subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s) [filtered]"
     body = "\n".join(lines)
 
-    # Send or dry run
     if os.getenv("SMTP_HOST"):
         if dry_run:
             print("DRY_RUN=1 enabled. Would send email:")
@@ -208,14 +226,13 @@ def main() -> None:
         print(subject)
         print(body)
 
-    # ✅ Mark ALL new items as seen (even those not emailed due to cap)
+    # ✅ Mark ALL filtered-new items as seen (so you get one email only)
     for it in all_new_items:
         seen.add(extract_id(it))
 
     state["seen_ids"] = list(seen)
     save_state(state)
     print(f"State updated. Total seen IDs now: {len(seen)}")
-
 
 if __name__ == "__main__":
     main()
