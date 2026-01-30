@@ -2,29 +2,110 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
+
 import requests
 
 from mailer import send_email
 
 STATE_PATH = Path("state.json")
-DOWNLOAD_DIR = Path("downloads")
 SYMBOL = os.getenv("SYMBOL", "KBANK")
 LANG = os.getenv("LANG", "th")  # "th" or "en"
 
 API_URL = "https://www.set.or.th/api/set/news/search"
 
+
 def ddmmyyyy(d: datetime) -> str:
     return d.strftime("%d/%m/%Y")
+
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
         return {"seen_ids": []}
-    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        # If state is corrupted, fail safe by resetting
+        return {"seen_ids": []}
+
 
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def fetch_news(from_date: str, to_date: str) -> list[dict]:
+
+def extract_id(item: dict) -> str:
+    # Prefer stable IDs returned by SET
+    for k in ("id", "newsId", "news_id"):
+        v = item.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+
+    # Fallback to URL if present
+    for k in ("url", "link", "detailUrl", "detailsUrl"):
+        v = item.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+
+    # Last resort: stable JSON string
+    return json.dumps(item, sort_keys=True, ensure_ascii=False)
+
+
+def extract_title(item: dict) -> str:
+    for k in ("headline", "title", "subject"):
+        v = item.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return "(no title)"
+
+
+def extract_publish_dt(item: dict) -> str:
+    # We don't assume exact field names; log whichever exists
+    for k in ("datetime", "dateTime", "publishDate", "publish_date", "date"):
+        v = item.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return ""
+
+
+def build_detail_url(item: dict) -> str:
+    # If API provides a direct URL, use it
+    for k in ("url", "link", "detailUrl", "detailsUrl"):
+        v = item.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+
+    # Otherwise build a SET news detail URL (commonly works)
+    _id = extract_id(item)
+    lang_path = "th" if LANG == "th" else "en"
+    return f"https://www.set.or.th/{lang_path}/market/news-and-alert/newsdetails?id={_id}&symbol={SYMBOL}"
+
+
+def _browser_headers_html() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+
+def _browser_headers_json(referer: str) -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": referer,
+        "Origin": "https://www.set.or.th",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
     params = {
         "symbol": SYMBOL,
         "fromDate": from_date,
@@ -35,189 +116,137 @@ def fetch_news(from_date: str, to_date: str) -> list[dict]:
 
     session = requests.Session()
 
-    # 1) Warm up cookies by visiting the real page first
     warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
-    session.get(
-        warm_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
-        timeout=30,
-    )
 
-    # 2) Call the API with browser-like headers + referer
+    # 1) warm up (cookies / WAF)
+    session.get(warm_url, headers=_browser_headers_html(), timeout=30)
+
+    # 2) call API with headers + referer
     r = session.get(
         API_URL,
         params=params,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": warm_url,
-            "Origin": "https://www.set.or.th",
-            "X-Requested-With": "XMLHttpRequest",
-        },
+        headers=_browser_headers_json(referer=warm_url),
         timeout=30,
     )
 
-    # If still blocked, show the response body in logs for debugging
     if r.status_code == 403:
-        raise RuntimeError(f"403 Forbidden from SET API. Response text: {r.text[:300]}")
+        # show a bit of body to help debugging if it ever happens again
+        raise RuntimeError(f"403 Forbidden from SET API. Body (first 300 chars): {r.text[:300]}")
 
     r.raise_for_status()
     data = r.json()
-    
+
+    # Defensive parsing: response shape can vary
     if isinstance(data, dict):
         for k in ("news", "data", "result"):
-            if k in data and isinstance(data[k], list):
-                return data[k]
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
     if isinstance(data, list):
         return data
     return []
 
-def extract_id(item: dict) -> str:
-    # prefer stable numeric/string id
-    for k in ("id", "newsId", "news_id"):
-        if k in item and item[k]:
-            return str(item[k])
-    # fallback to URL if present
-    for k in ("url", "link"):
-        if k in item and item[k]:
-            return str(item[k])
-    return json.dumps(item, sort_keys=True)
 
-def extract_title(item: dict) -> str:
-    for k in ("headline", "title", "subject"):
-        if k in item and item[k]:
-            return str(item[k])
-    return "(no title)"
+def main() -> None:
+    # --- optional test modes ---
+    smtp_test = os.getenv("SMTP_TEST", "0") == "1"
+    force_send = os.getenv("FORCE_SEND", "0") == "1"
+    dry_run = os.getenv("DRY_RUN", "0") == "1"
 
-def extract_detail_url(item: dict) -> str | None:
-    # Sometimes the API returns a details URL; if not, construct common pattern if fields exist
-    for k in ("url", "link", "detailUrl", "detailsUrl"):
-        if k in item and item[k]:
-            return str(item[k])
-    # If API gives id + symbol, SET details pages often look like:
-    # https://www.set.or.th/en/market/news-and-alert/newsdetails?id=XXXX&symbol=KBANK
-    _id = extract_id(item)
-    return f"https://www.set.or.th/{'en' if LANG=='en' else 'th'}/market/news-and-alert/newsdetails?id={_id}&symbol={SYMBOL}"
-
-def download_attachments(item: dict) -> list[Path]:
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    # API sometimes returns "documents" / "files" with URLs
-    candidates = []
-    for k in ("documents", "files", "attachments"):
-        if k in item and isinstance(item[k], list):
-            candidates.extend(item[k])
-
-    paths: list[Path] = []
-    headers = {"User-Agent": "Mozilla/5.0 (GitHub Actions)"}
-
-    for doc in candidates:
-        if not isinstance(doc, dict):
-            continue
-        url = doc.get("url") or doc.get("link")
-        name = doc.get("name") or doc.get("fileName") or None
-        if not url:
-            continue
-
-        # Basic filename
-        if not name:
-            name = url.split("?")[0].split("/")[-1] or "attachment.bin"
-
-        out = DOWNLOAD_DIR / name
-        resp = requests.get(url, headers=headers, timeout=60)
-        resp.raise_for_status()
-        out.write_bytes(resp.content)
-        paths.append(out)
-
-    return paths
-
-def main():
-    # --- SMTP test mode (manual run) ---
-    if os.getenv("SMTP_TEST", "0") == "1":
+    if smtp_test:
+        print("SMTP_TEST=1 detected. Sending test email now...")
         send_email(
             subject=f"SMTP TEST: SET watcher ({SYMBOL})",
-            body="If you got this email, SMTP secrets are working.",
-            attachments=[]
+            body="If you got this email, Gmail SMTP secrets are working.",
+            attachments=[],
         )
         print("SMTP test email sent.")
         return
-        
+
     state = load_state()
     seen = set(state.get("seen_ids", []))
 
+    lookback_days = int(os.getenv("LOOKBACK_DAYS", "14"))
+    max_new_items = int(os.getenv("MAX_NEW_ITEMS", "5"))
+
     today = datetime.now()
-    from_dt = today - timedelta(days=int(os.getenv("LOOKBACK_DAYS", "14")))
+    from_dt = today - timedelta(days=lookback_days)
+
+    print(f"Symbol={SYMBOL} Lang={LANG}")
+    print(f"Lookback: {lookback_days} day(s)  Range: {ddmmyyyy(from_dt)} -> {ddmmyyyy(today)}")
+    print(f"Seen IDs in state: {len(seen)}")
 
     items = fetch_news(ddmmyyyy(from_dt), ddmmyyyy(today))
+    print(f"Fetched {len(items)} item(s) from SET API")
 
-    # Sort newest-first if date exists
-    # (leave as-is if not)
-    def sort_key(x):
-        for k in ("datetime", "dateTime", "publishDate", "date"):
-            if k in x and x[k]:
-                return str(x[k])
-        return ""
-    items = sorted(items, key=sort_key, reverse=True)
+    # Show sample IDs for debugging
+    for it in items[:3]:
+        print("Sample:", extract_id(it), "|", extract_publish_dt(it), "|", extract_title(it)[:80])
 
-    new_items = []
+    # Determine new items
+    new_items: list[dict] = []
     for it in items:
         _id = extract_id(it)
         if _id not in seen:
             new_items.append(it)
 
+    print(f"Computed new items: {len(new_items)}")
+
+    # If nothing new, optionally force-send a demo (latest 1 item)
+    if not new_items and force_send:
+        print("FORCE_SEND=1 enabled. Using latest 1 item as demo.")
+        new_items = items[:1]
+
     if not new_items:
         print("No new news.")
         return
 
-    max_items = int(os.getenv("MAX_NEW_ITEMS", "5"))
-    new_items = new_items[:max_items]
-  
-    lines = []
-    all_attachments: list[Path] = []
+    # Cap
+    new_items = new_items[:max_new_items]
+    print(f"Will notify {len(new_items)} item(s) (capped by MAX_NEW_ITEMS={max_new_items})")
+
+    # Build email body
+    lines: list[str] = []
+    newly_seen_ids: list[str] = []
 
     for it in new_items:
         _id = extract_id(it)
         title = extract_title(it)
-        url = extract_detail_url(it)
+        pub = extract_publish_dt(it)
+        url = build_detail_url(it)
 
-        lines.append(f"- {title}\n  {url}")
+        block = f"- {title}"
+        if pub:
+            block += f"\n  Date: {pub}"
+        block += f"\n  Link: {url}"
 
-        # Try to download attachments if API includes them (safe if none)
-        try:
-            all_attachments.extend(download_attachments(it))
-        except Exception as e:
-            print(f"Attachment download failed for {_id}: {e}")
+        lines.append(block)
+        newly_seen_ids.append(_id)
 
+    subject = f"SET Alert ({SYMBOL}): {len(new_items)} item(s)"
+    body = "\n\n".join(lines)
+
+    # Send email (or dry run)
+    if os.getenv("SMTP_HOST"):
+        if dry_run:
+            print("DRY_RUN=1 enabled. Would send email:")
+            print("SUBJECT:", subject)
+            print("BODY:\n", body)
+        else:
+            send_email(subject=subject, body=body, attachments=[])
+            print("Email sent.")
+    else:
+        print("SMTP not configured; printing instead:\n")
+        print(subject)
+        print(body)
+
+    # Update state only if we successfully reached here (even in DRY_RUN)
+    for _id in newly_seen_ids:
         seen.add(_id)
 
     state["seen_ids"] = list(seen)
     save_state(state)
-
-    subject = f"SET Alert ({SYMBOL}): {len(new_items)} new item(s)"
-    body = "\n\n".join(lines)
-
-    # email only if SMTP env vars exist
-    if os.getenv("SMTP_HOST"):
-        send_email(subject=subject, body=body, attachments=all_attachments)
-        print("Email sent.")
-    else:
-        print("SMTP not configured; printing news:\n")
-        print(body)
-   
-    # --- SMTP test mode (manual run) ---
-    if os.getenv("SMTP_TEST", "0") == "1":
-        send_email(
-            subject=f"SMTP TEST: SET watcher ({SYMBOL})",
-            body="If you got this email, SMTP secrets are working.",
-            attachments=[]
-        )
-        print("SMTP test email sent.")
-        return
+    print(f"State updated. Total seen IDs now: {len(seen)}")
 
 if __name__ == "__main__":
     main()
