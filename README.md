@@ -49,12 +49,13 @@ You will store it in GitHub Secrets (never hardcode it).
 Create these repository secrets:
 
 | Secret name | Example |
+|---|---|
 | `SMTP_HOST` | `smtp.gmail.com` |
 | `SMTP_PORT` | `587` |
 | `SMTP_USER` | `your.email@gmail.com` |
 | `SMTP_PASS` | Gmail App Password (16 chars) |
 | `EMAIL_FROM` | `your.email@gmail.com` |
-| `EMAIL_TO` | `you@company.com` (or multiple separated by comma if your mailer supports it) |
+| `EMAIL_TO` | `you@company.com` (or multiple separated by comma if your mailer supports i
 
 > Note: `EMAIL_TO` can be your bank email if your corporate policy allows receiving external email.
 
