@@ -33,9 +33,9 @@ jobs:
           MAX_NEW_ITEMS: "5"
 
           # For testing purpose
-          #SMTP_TEST: "1" #
-          FORCE_SEND: "1"
-          DEBUG_JSON: "1"
+          #SMTP_TEST: "1"
+          #FORCE_SEND: "1"
+          #DEBUG_JSON: "1"
 
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
