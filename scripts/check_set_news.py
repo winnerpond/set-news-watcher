@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -15,7 +16,7 @@ LANG = os.getenv("LANG", "th")  # "th" or "en"
 
 API_URL = "https://www.set.or.th/api/set/news/search"
 
-# Filter controls (set via GitHub Actions env if you want)
+# Filter controls
 HEADLINE_FILTER = os.getenv(
     "HEADLINE_FILTER",
     "รายงานผลการซื้อหุ้นคืนกรณีเพื่อการบริหารทางการเงิน",
@@ -23,6 +24,7 @@ HEADLINE_FILTER = os.getenv(
 FILTER_MODE = os.getenv("FILTER_MODE", "exact").strip().lower()  # exact | contains
 
 
+# ---------- helpers ----------
 def ddmmyyyy(d: datetime) -> str:
     return d.strftime("%d/%m/%Y")
 
@@ -111,10 +113,6 @@ def _browser_headers_json(referer: str) -> dict[str, str]:
 
 
 def make_session() -> tuple[requests.Session, str]:
-    """
-    Create a requests session and warm it up against the quote/news page to avoid 403.
-    Returns (session, warm_url).
-    """
     session = requests.Session()
     warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
     session.get(warm_url, headers=_browser_headers_html(), timeout=30)
@@ -143,11 +141,11 @@ def fetch_news(session: requests.Session, warm_url: str, from_date: str, to_date
 
     data = r.json()
 
-    # ✅ Confirmed structure: {"totalCount": ..., "newsInfoList": [...]}
+    # Confirmed structure: {"totalCount": ..., "newsInfoList": [...]}
     if isinstance(data, dict) and isinstance(data.get("newsInfoList"), list):
         return data["newsInfoList"]
 
-    # Fallback keys (if SET changes later)
+    # Fallback keys
     if isinstance(data, dict):
         for k in ("news", "data", "result"):
             v = data.get(k)
@@ -157,42 +155,77 @@ def fetch_news(session: requests.Session, warm_url: str, from_date: str, to_date
     return []
 
 
-def fetch_news_detail_html(session: requests.Session, detail_url: str) -> Optional[str]:
+# ---------- detail page extraction (LINE-BASED, not table-based) ----------
+def fetch_news_detail_text_lines(session: requests.Session, detail_url: str) -> Optional[list[str]]:
+    """
+    Fetch newsdetails page and return a list of clean text lines.
+    This works because the buyback content is plain text lines, not <table><td>.
+    """
     try:
         resp = session.get(detail_url, headers=_browser_headers_html(), timeout=30)
         resp.raise_for_status()
-        return resp.text
     except Exception as e:
         print(f"Detail fetch failed: {detail_url} | {repr(e)}")
         return None
 
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
 
-def parse_buyback_fields_from_html(html: str) -> dict[str, str]:
-    """
-    Parse key-value rows from HTML tables:
-    <tr><td>label</td><td>value</td></tr>
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    data: dict[str, str] = {}
+    # Preserve newlines (key point)
+    raw = soup.get_text("\n", strip=True)
 
-    for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) >= 2:
-            key = tds[0].get_text(strip=True)
-            val = tds[1].get_text(" ", strip=True)
+    # Keep only the relevant section to reduce noise
+    start_markers = ["รายงานผลการซื้อหุ้นคืน", "รายละเอียดแบบเต็ม"]
+    end_marker = "สารสนเทศฉบับนี้จัดทำและเผยแพร่"
+
+    start_idx = 0
+    for m in start_markers:
+        i = raw.find(m)
+        if i != -1:
+            start_idx = i
+            break
+
+    end_idx = raw.find(end_marker)
+    if end_idx == -1:
+        end_idx = len(raw)
+
+    clipped = raw[start_idx:end_idx]
+
+    lines = []
+    for ln in clipped.split("\n"):
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+
+    return lines
+
+
+def parse_kv_from_lines(lines: list[str]) -> dict[str, str]:
+    """
+    Parse lines formatted like:
+    'เรื่อง : แบบรายงาน...'
+    into { 'เรื่อง': 'แบบรายงาน...' }
+    """
+    kv: dict[str, str] = {}
+    for ln in lines:
+        if ":" in ln:
+            left, right = ln.split(":", 1)
+            key = left.strip()
+            val = right.strip()
             if key and val:
-                data[key] = val
+                kv[key] = val
+    return kv
 
-    return data
 
-
-def format_buyback_summary_from_fields(fields: dict[str, str], link: str, api_dt: str) -> str:
+def format_buyback_summary(kv: dict[str, str], link: str, api_dt: str) -> str:
     def g(k: str) -> str:
-        return fields.get(k, "-")
+        return kv.get(k, "-")
 
+    # Labels on the page (Thai)
     lines = [
         "รายงานผลการซื้อหุ้นคืน (สรุป)",
-        f"Time (SET): {api_dt or '(no timestamp)'}",
+        f"Time (SET): {api_dt or '-'}",
         f"Link: {link}",
         "",
         f"เรื่อง: {g('เรื่อง')}",
@@ -200,26 +233,26 @@ def format_buyback_summary_from_fields(fields: dict[str, str], link: str, api_dt
         f"วิธีการซื้อหุ้นคืน: {g('วิธีการซื้อหุ้นคืน')}",
         f"วันที่ครบกำหนดโครงการ: {g('วันที่ครบกำหนดโครงการ')}",
         f"วันที่คณะกรรมการมีมติ: {g('วันที่คณะกรรมการมีมติ')}",
-        f"จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ: {g('จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ (หุ้น)')} หุ้น",
-        f"% ต่อหุ้นที่ชำระแล้ว: {g('%ของจำนวนหุ้นซื้อคืนสูงสุดต่อจำนวนหุ้นที่ชำระแล้ว')}",
+        f"จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ (หุ้น): {g('จำนวนหุ้นซื้อคืนสูงสุดตามโครงการ (หุ้น)')}",
+        f"%ของจำนวนหุ้นซื้อคืนสูงสุดต่อจำนวนหุ้นที่ชำระแล้ว: {g('%ของจำนวนหุ้นซื้อคืนสูงสุดต่อจำนวนหุ้นที่ชำระแล้ว')}",
         "",
-        "ผลการซื้อหุ้นคืน (ล่าสุด)",
+        "1) ผลการซื้อหุ้นคืน",
         f"วันที่ซื้อหุ้นคืน: {g('วันที่ซื้อหุ้นคืน')}",
-        f"จำนวนหุ้นซื้อคืน: {g('จำนวนหุ้นซื้อคืน(หุ้น)')} หุ้น",
-        f"ราคาสูงสุด: {g('ราคาที่ซื้อต่อหุ้นหรือราคาสูงสุด(บาท/หุ้น)')} บาท",
-        f"ราคาต่ำสุด: {g('ราคาต่ำสุด(บาท/หุ้น)')} บาท",
-        f"มูลค่ารวม: {g('มูลค่ารวม(บาท)')} บาท",
+        f"จำนวนหุ้นซื้อคืน(หุ้น): {g('จำนวนหุ้นซื้อคืน(หุ้น)')}",
+        f"ราคาที่ซื้อต่อหุ้นหรือราคาสูงสุด(บาท/หุ้น): {g('ราคาที่ซื้อต่อหุ้นหรือราคาสูงสุด(บาท/หุ้น)')}",
+        f"ราคาต่ำสุด(บาท/หุ้น): {g('ราคาต่ำสุด(บาท/หุ้น)')}",
+        f"มูลค่ารวม(บาท): {g('มูลค่ารวม(บาท)')}",
         "",
-        "สะสมทั้งโครงการ",
-        f"จำนวนสะสม: {g('จำนวนรวมของหุ้นซื้อคืนในโครงการจนถึงปัจจุบัน')} หุ้น",
-        f"% ต่อหุ้นที่ชำระแล้ว: {g('%ของจำนวนหุ้นซื้อคืนต่อจำนวนหุ้นที่ชำระแล้ว')}",
-        f"มูลค่าสะสม: {g('มูลค่ารวมที่ซื้อคืน(บาท)')} บาท",
+        "2) จำนวนหุ้นซื้อคืนทั้งสิ้น",
+        f"จำนวนรวมของหุ้นซื้อคืนในโครงการจนถึงปัจจุบัน: {g('จำนวนรวมของหุ้นซื้อคืนในโครงการจนถึงปัจจุบัน')}",
+        f"%ของจำนวนหุ้นซื้อคืนต่อจำนวนหุ้นที่ชำระแล้ว: {g('%ของจำนวนหุ้นซื้อคืนต่อจำนวนหุ้นที่ชำระแล้ว')}",
+        f"มูลค่ารวมที่ซื้อคืน(บาท): {g('มูลค่ารวมที่ซื้อคืน(บาท)')}",
     ]
     return "\n".join(lines)
 
 
+# ---------- main ----------
 def main() -> None:
-    # Optional test flags
     smtp_test = os.getenv("SMTP_TEST", "0") == "1"
     force_send = os.getenv("FORCE_SEND", "0") == "1"
     dry_run = os.getenv("DRY_RUN", "0") == "1"
@@ -281,7 +314,7 @@ def main() -> None:
         print("No new news.")
         return
 
-    # ✅ ONE EMAIL ONLY behavior: email up to MAX_NEW_ITEMS, but mark ALL new items as seen.
+    # ONE EMAIL ONLY: email up to MAX_NEW_ITEMS, but mark ALL new items as seen.
     notify_items = all_new_items[:max_new_items]
 
     blocks: list[str] = []
@@ -289,18 +322,25 @@ def main() -> None:
         api_dt = extract_datetime(it)
         url = extract_url(it)
 
-        html = fetch_news_detail_html(session, url) or ""
-        fields = parse_buyback_fields_from_html(html)
-
-        if fields:
-            blocks.append(format_buyback_summary_from_fields(fields, link=url, api_dt=api_dt))
-        else:
+        lines = fetch_news_detail_text_lines(session, url)
+        if not lines:
             blocks.append(
-                f"รายงานผลการซื้อหุ้นคืน (สรุป)\n"
-                f"Time (SET): {api_dt or '(no timestamp)'}\n"
-                f"Link: {url}\n\n"
-                f"(ไม่สามารถอ่านข้อมูลจากตารางได้)"
+                f"รายงานผลการซื้อหุ้นคืน (สรุป)\nTime (SET): {api_dt or '-'}\nLink: {url}\n\n(ไม่สามารถดึงข้อความจากหน้าได้)"
             )
+            continue
+
+        kv = parse_kv_from_lines(lines)
+
+        # If parsing produced nothing, include a small debug snippet
+        if not kv:
+            snippet = "\n".join(lines[:30])
+            blocks.append(
+                f"รายงานผลการซื้อหุ้นคืน (สรุป)\nTime (SET): {api_dt or '-'}\nLink: {url}\n\n"
+                f"(ไม่สามารถ parse เป็น key:value ได้)\n\n--- snippet ---\n{snippet}"
+            )
+            continue
+
+        blocks.append(format_buyback_summary(kv, link=url, api_dt=api_dt))
 
     subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s) [filtered]"
     body = ("\n\n" + ("-" * 60) + "\n\n").join(blocks)
@@ -309,16 +349,16 @@ def main() -> None:
         if dry_run:
             print("DRY_RUN=1 enabled. Would send email:")
             print("SUBJECT:", subject)
-            print("BODY:\n", body[:2000])
+            print("BODY:\n", body[:2500])
         else:
             send_email(subject=subject, body=body, attachments=[])
             print("Email sent.")
     else:
         print("SMTP not configured; printing instead:\n")
         print(subject)
-        print(body[:2000])
+        print(body[:2500])
 
-    # ✅ Mark ALL new items as seen (so you only get one email)
+    # Mark ALL new items as seen
     for it in all_new_items:
         seen.add(extract_id(it))
 
