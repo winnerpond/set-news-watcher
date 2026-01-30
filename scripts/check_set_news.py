@@ -342,7 +342,7 @@ def main() -> None:
 
         blocks.append(format_buyback_summary(kv, link=url, api_dt=api_dt))
 
-    subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s) [filtered]"
+    subject = f"SET Alert ({SYMBOL}): {len(all_new_items)} new item(s)"
     body = ("\n\n" + ("-" * 60) + "\n\n").join(blocks)
 
     if os.getenv("SMTP_HOST"):
