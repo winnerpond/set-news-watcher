@@ -37,7 +37,7 @@ jobs:
 
           # For testing purpose
           #SMTP_TEST: "1"
-          #FORCE_SEND: "1"
+          FORCE_SEND: "1"
           #DEBUG_JSON: "1"
 
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
