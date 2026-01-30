@@ -105,7 +105,20 @@ def _browser_headers_json(referer: str) -> dict[str, str]:
     }
 
 
-def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
+def _find_list_of_dicts(obj):
+    """Return the first list found that looks like a list[dict]."""
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_list_of_dicts(v)
+            if found is not None:
+                return found
+    return None
+
+def fetch_news(from_date: str, to_date: str) -> list[dict]:
     params = {
         "symbol": SYMBOL,
         "fromDate": from_date,
@@ -115,13 +128,11 @@ def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
     }
 
     session = requests.Session()
-
     warm_url = f"https://www.set.or.th/{'th' if LANG=='th' else 'en'}/market/product/stock/quote/{SYMBOL}/news"
 
-    # 1) warm up (cookies / WAF)
+    # warm up cookies
     session.get(warm_url, headers=_browser_headers_html(), timeout=30)
 
-    # 2) call API with headers + referer
     r = session.get(
         API_URL,
         params=params,
@@ -130,22 +141,19 @@ def fetch_news(from_date: str, to_date: str) -> list[dict[str, Any]]:
     )
 
     if r.status_code == 403:
-        # show a bit of body to help debugging if it ever happens again
         raise RuntimeError(f"403 Forbidden from SET API. Body (first 300 chars): {r.text[:300]}")
-
     r.raise_for_status()
+
     data = r.json()
 
-    # Defensive parsing: response shape can vary
-    if isinstance(data, dict):
-        for k in ("news", "data", "result"):
-            v = data.get(k)
-            if isinstance(v, list):
-                return v
-    if isinstance(data, list):
-        return data
-    return []
+    # DEBUG: show the response shape in Actions logs (optional)
+    if os.getenv("DEBUG_JSON", "0") == "1":
+        import json
+        print("DEBUG_JSON response keys/type:", type(data))
+        print(json.dumps(data, ensure_ascii=False)[:2000])  # first 2000 chars
 
+    found = _find_list_of_dicts(data)
+    return found or []]
 
 def main() -> None:
     # --- optional test modes ---
