@@ -19,29 +19,21 @@ Current default use case:
 7. Updates `state.json` and commits it back to the repo (so future runs won’t re-send)
 
 ## Project structure
-set-news-watcher/
-│
+
+```
+.
 ├── .github/
 │   └── workflows/
-│       └── set-news-watcher.yml        # GitHub Actions workflow
-│
-├── app/
-│   ├── __init__.py
-│   ├── config.py                       # Constants & env configuration
-│   ├── fetch_set_news.py               # SET API + detail page fetching
-│   ├── parse_buyback.py                # Buyback content extraction
-│   ├── notifier.py                     # Email formatting & sending
-│   └── state.py                        # state.json read/write logic
+│       └── set-news.yml          # GitHub Actions workflow
 │
 ├── scripts/
-│   └── run_watcher.py                  # Entry point (calls app logic)
+│   └── check_set_news.py         # Main watcher script
 │
-├── state/
-│   └── state.json                      # Persisted seen news IDs
-│
-├── requirements.txt
-├── README.md
-└── .gitignore
+├── mailer.py                     # Gmail SMTP helper
+├── requirements.txt              # Python dependencies
+├── state.json                    # Seen news IDs (auto-updated)
+└── README.md
+```
 
 ## Requirements
 
