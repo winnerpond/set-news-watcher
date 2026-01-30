@@ -31,7 +31,11 @@ jobs:
           LANG: th
           LOOKBACK_DAYS: "14"
           MAX_NEW_ITEMS: "5"
+
+          # For testing purpose
           #SMTP_TEST: "1" # << -- Test one for test purpose (1 = test)
+          FORCE_SEND: "1"
+
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
