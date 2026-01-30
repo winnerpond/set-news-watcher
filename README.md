@@ -20,13 +20,13 @@ Current default use case:
 
 ## Project structure
 ├── scripts/
-    └── check_set_news.py
-    └── mailer.py
+│   └── check_set_news.py
+├── mailer.py
 ├── requirements.txt
 ├── state.json
 └── .github/
-    └── workflows/
-    └── set-news.yml
+└── workflows/
+└── set-news.yml
 
 ## Requirements
 
