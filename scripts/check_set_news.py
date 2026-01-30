@@ -118,6 +118,20 @@ def _find_list_of_dicts(obj):
                 return found
     return None
 
+def _find_list_of_dicts(obj):
+    """Return the first list found that looks like a list[dict]."""
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_list_of_dicts(v)
+            if found is not None:
+                return found
+    return None
+
+
 def fetch_news(from_date: str, to_date: str) -> list[dict]:
     params = {
         "symbol": SYMBOL,
@@ -153,7 +167,7 @@ def fetch_news(from_date: str, to_date: str) -> list[dict]:
         print(json.dumps(data, ensure_ascii=False)[:2000])  # first 2000 chars
 
     found = _find_list_of_dicts(data)
-    return found or []]
+    return found or []
 
 def main() -> None:
     # --- optional test modes ---
